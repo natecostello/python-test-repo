@@ -25,6 +25,11 @@ chmod +x setup_venv.sh
 - Code in `src/`
 - Tests in `tests/`
 
+## Activating the Virtual Env
+```bash
+source .venv/bin/activate
+```
+
 ## Tools
 - `black` for formatting
 - `flake8` for linting
