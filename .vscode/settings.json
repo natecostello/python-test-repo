@@ -8,5 +8,33 @@
   "python.testing.pytestArgs": [
     "tests"
   ],
-  "makefile.configureOnOpen": false
+  "makefile.configureOnOpen": false,
+  "github.copilot.advanced": {
+    "debug.overrideEngine": "copilot-codex",
+    "debug.testOverrideProxyUrl": "",
+    "debug.overrideProxyUrl": ""
+  },
+  "github.copilot.editor.enableAutoCompletions": true,
+  "github.copilot.inlineSuggest.enable": true,
+  "python.analysis.autoImportCompletions": false,
+  "python.analysis.completeFunctionParens": false,
+  "python.analysis.indexing": false,
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "",
+      "depth": 1
+    }
+  ],
+  "jupyter.askForKernelRestart": false,
+  "jupyter.widgetScriptSources": [
+    "jsdelivr.com",
+    "unpkg.com"
+  ],
+  "extensions.autoUpdate": false,
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/*/**": true,
+    "**/.venv/**": true
+  }
 }
