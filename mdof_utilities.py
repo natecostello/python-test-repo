@@ -1,3 +1,7 @@
+import numpy as np
+from scipy.linalg import eig
+from scipy.integrate import solve_ivp
+
 """
 Multi-Degree-of-Freedom (MDOF) System Utilities
 
@@ -20,9 +24,6 @@ Functions:
 Author: Generated from mdof_evaluation_refactored.ipynb
 """
 
-import numpy as np
-from scipy.linalg import eig
-from scipy.integrate import solve_ivp
 
 # =============================================================================
 # SYSTEM CLASSES
@@ -275,6 +276,70 @@ def time_response(system, t, a_base):
     a_resp = xdd + a_b_vec[np.newaxis, :]
 
     return t, a_resp
+
+
+def time_response_tdof(system, t, a_base, rtol=1e-7, atol=1e-9, method="RK45"):
+    """
+    Two-DOF base-excited stack, consistent with your TDOF_System indexing:
+      index 0 (m1,k1,c1) = MIDDLE / base-connected
+      index 1 (m2,k2,c2) = TOP (connected to middle via k2,c2)
+
+    Coordinates integrated (pairwise-relative):
+        u1 = x_top - x_mid        (across k2,c2)
+        u2 = x_mid - y_base       (across k1,c1)
+
+    EOM in these coordinates:
+        m2*(u1¨ + u2¨) + c2*u1˙ + k2*u1               = - m2 * a_base
+        m1*u2¨ + c1*u2˙ + k1*u2 - c2*u1˙ - k2*u1      = - m1 * a_base
+
+    Absolute accelerations (RETURN ORDER MATCHES CLASS: [middle, top]):
+        a_mid = u2¨ + a_base
+        a_top = u1¨ + u2¨ + a_base
+    """
+    # Unpack
+    m1 = float(system.m1)
+    k1 = float(system.k1)
+    c1 = float(system.c1)  # middle/base
+    m2 = float(system.m2)
+    k2 = float(system.k2)
+    c2 = float(system.c2)  # top
+
+    t = np.asarray(t, dtype=float)
+    a_base = np.asarray(a_base, dtype=float)
+    if t.ndim != 1 or a_base.ndim != 1 or len(t) != len(a_base):
+        raise ValueError("t and a_base must be 1D arrays of equal length")
+
+    # State z = [u1, u2, v1, v2]
+    def rhs(ti, z):
+        u1, u2, v1, v2 = z
+        ab = np.interp(ti, t, a_base)
+
+        # from EOM above
+        r_upper = -c2 * v1 - k2 * u1 - m2 * ab
+        r_lower = -m1 * ab - c1 * v2 - k1 * u2 + c2 * v1 + k2 * u1
+
+        u2dd = r_lower / m1
+        u1dd = (r_upper - m2 * u2dd) / m2
+
+        return np.array([v1, v2, u1dd, u2dd], float)
+
+    z0 = np.zeros(4)
+    sol = solve_ivp(
+        rhs, (t[0], t[-1]), z0, t_eval=t, rtol=rtol, atol=atol, method=method
+    )
+
+    # Recover accelerations exactly as in rhs (no finite differences)
+    u1, u2, v1, v2 = sol.y
+    ab = a_base
+    r_upper = -c2 * v1 - k2 * u1 - m2 * ab
+    r_lower = -m1 * ab - c1 * v2 - k1 * u2 + c2 * v1 + k2 * u1
+    u2dd = r_lower / m1
+    u1dd = (r_upper - m2 * u2dd) / m2
+
+    a_mid = u2dd + ab  # row 0 (middle/base-connected)
+    a_top = u1dd + u2dd + ab  # row 1 (top)
+
+    return t, np.vstack((a_mid, a_top))
 
 
 # =============================================================================
