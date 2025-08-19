@@ -20,6 +20,7 @@ Functions:
 - time_response: Compute MDOF system response to base acceleration time series
 - shock_response_spectrum: Compute Shock Response Spectrum (SRS) with speed
   optimization options
+- generate_half_sine_pulse: Generate half-sine pulse shock input for testing
 
 Author: Generated from mdof_evaluation_refactored.ipynb
 """
@@ -509,3 +510,44 @@ def shock_response_spectrum(
             srs_values[i] = np.max(np.abs(a_input))
 
     return srs_values
+
+
+# =============================================================================
+# SHOCK INPUT GENERATION FUNCTIONS
+# =============================================================================
+
+
+def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000):
+    """
+    Generate a half-sine pulse shock input.
+
+    This is the classic shock input used in Steinberg's analysis and
+    military/aerospace shock testing standards.
+
+    Parameters:
+    -----------
+    amplitude : float
+        Peak acceleration amplitude (g)
+    duration : float
+        Pulse duration (seconds)
+    total_time : float
+        Total analysis time (seconds)
+    sample_rate : float
+        Sampling rate (Hz)
+
+    Returns:
+    --------
+    t : ndarray
+        Time vector
+    a : ndarray
+        Acceleration time series
+    """
+    dt = 1.0 / sample_rate
+    t = np.arange(0, total_time, dt)
+    a = np.zeros_like(t)
+
+    # Half-sine pulse during pulse duration
+    pulse_mask = t <= duration
+    a[pulse_mask] = amplitude * np.sin(np.pi * t[pulse_mask] / duration)
+
+    return t, a
