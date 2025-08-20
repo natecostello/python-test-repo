@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.linalg import eig
 from scipy.integrate import solve_ivp
+from scipy.signal import cont2discrete, lfilter
 
 """
 Multi-Degree-of-Freedom (MDOF) System Utilities
@@ -21,6 +22,8 @@ Functions:
 - shock_response_spectrum: Compute Shock Response Spectrum (SRS) with speed
   optimization options
 - generate_half_sine_pulse: Generate half-sine pulse shock input for testing
+- synthesize_shock_pulse: Synthesize acceleration signals matching target SRS
+  using wavelet or damped sine basis functions
 
 Author: Generated from mdof_evaluation_refactored.ipynb
 """
@@ -551,3 +554,338 @@ def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000)
     a[pulse_mask] = amplitude * np.sin(np.pi * t[pulse_mask] / duration)
 
     return t, a
+
+
+# =============================================================================
+# SHOCK SYNTHESIS FUNCTIONS
+# =============================================================================
+
+
+def synthesize_shock_pulse(
+    srs_spec_hz_g,
+    fs=20480,
+    duration=0.25,
+    q=10.0,
+    freqs_per_octave=12,
+    n_trials=120,
+    inner_iters=18,
+    nm_choices=(5, 7, 9, 11, 13),
+    rng_seed=None,
+    # shock-shaping knobs (both bases):
+    t0=0.010,  # main shock start [s]
+    tail_span=0.060,  # length of trailing tail [s]
+    focus=0.85,  # 0–1: how tightly arrivals cluster near t0
+    late_energy_tau=0.050,  # window for the time-concentration score [s]
+    w_time=0.6,  # weight of time-concentration in winner score
+    w_simplicity=0.08,  # weight on zero-crossing count
+    clip_scale=(0.25, 4.0),  # numerical guard for SRS scaling (not a physical limit)
+    # basis selection:
+    basis="wavelet",  # "wavelet" or "damped_sine"
+    ds_zeta=0.06,  # damping ratio for damped-sine basis (≈ 1/(2Q_ds))
+    zero_drift_fix=None,  # None | "poly" (optional drift cleanup for damped_sine)
+):
+    """
+    SRS-matching shock synthesis with a 'shocky' time profile.
+
+    Synthesizes acceleration time series that match a specified Shock Response Spectrum
+    (SRS) using either compact-support NESC wavelets or damped sine basis functions
+    with iterative SRS scaling optimization.
+
+    Choose basis="wavelet" (compact-support NESC wavelets) or basis="damped_sine"
+    (A * e^{-ζ*2πf*t} * sin(2πf*t)), both using iterative SRS scaling.
+
+    Parameters
+    ----------
+    srs_spec_hz_g : array_like
+        Target SRS specification as (M,2) array of (freq_Hz, SRS_G) pairs
+    fs : float, optional
+        Sample rate (Hz), default 20480
+    duration : float, optional
+        Signal duration (seconds), default 0.25
+    q : float, optional
+        Quality factor for SRS calculation, default 10.0
+    freqs_per_octave : int, optional
+        Frequency resolution for synthesis grid, default 12
+    n_trials : int, optional
+        Number of random synthesis trials, default 120
+    inner_iters : int, optional
+        SRS scaling iterations per trial, default 18
+    nm_choices : tuple, optional
+        Wavelet support parameter choices, default (5,7,9,11,13)
+    rng_seed : int, optional
+        Random seed for reproducibility, default None
+    t0 : float, optional
+        Main shock start time (s), default 0.010
+    tail_span : float, optional
+        Length of trailing tail (s), default 0.060
+    focus : float, optional
+        Clustering tightness near t0 (0-1), default 0.85
+    late_energy_tau : float, optional
+        Time window for concentration score (s), default 0.050
+    w_time : float, optional
+        Weight of time-concentration in score, default 0.6
+    w_simplicity : float, optional
+        Weight of zero-crossing count, default 0.08
+    clip_scale : tuple, optional
+        Scaling guard limits, default (0.25, 4.0)
+    basis : str, optional
+        Basis function type: "wavelet" or "damped_sine", default "wavelet"
+    ds_zeta : float, optional
+        Damping ratio for damped-sine basis, default 0.06
+    zero_drift_fix : str, optional
+        Drift cleanup method: None or "poly", default None
+
+    Returns
+    -------
+    t : ndarray
+        Time vector (seconds)
+    acc_g : ndarray
+        Synthesized acceleration time series (g)
+    report : dict
+        Synthesis results and metrics including:
+        - freqs_hz: frequency grid used
+        - target_srs_g: target SRS values
+        - achieved_srs_g: achieved SRS values
+        - max_abs_error_db: maximum SRS error (dB)
+        - peak_accel_g: peak acceleration (g)
+        - winner_trial: best trial number
+        - basis: basis function used
+
+    Examples
+    --------
+    >>> # Define target SRS specification
+    >>> srs_spec = np.array([[10.0, 20.0],    # 10 Hz -> 20g
+    ...                      [100.0, 50.0],   # 100 Hz -> 50g
+    ...                      [1000.0, 50.0]]) # 1000 Hz -> 50g
+    >>>
+    >>> # Synthesize with damped sine basis
+    >>> t, acc, info = synthesize_shock_pulse(srs_spec,
+    ...                                       basis="damped_sine",
+    ...                                       n_trials=100)
+    >>>
+    >>> print(f"Peak acceleration: {info['peak_accel_g']:.1f} g")
+    >>> print(f"SRS matching error: {info['max_abs_error_db']:.2f} dB")
+
+    Notes
+    -----
+    The algorithm uses a two-level optimization:
+    1. Outer loop: Random trials with different delay patterns and parameters
+    2. Inner loop: Iterative SRS-based amplitude scaling for each trial
+
+    Damped sine basis often performs better with lower complexity settings
+    (fewer freqs_per_octave, fewer inner_iters) due to natural physics matching
+    and overfitting prevention.
+
+    References
+    ----------
+    Based on shock synthesis methods for vibration testing and SRS matching.
+    """
+
+    rng = np.random.default_rng(rng_seed)
+
+    # ---------- Helper functions ----------
+    def log_interp(x, xp, fp):
+        """Logarithmic interpolation"""
+        x = np.asarray(x)
+        xp = np.asarray(xp)
+        fp = np.asarray(fp)
+        lx = np.log10(x)
+        lxp = np.log10(xp)
+        lfp = np.log10(fp)
+        out = np.interp(lx, lxp, lfp, left=lfp[0], right=lfp[-1])
+        return 10**out
+
+    def build_freq_grid(f_lo, f_hi, nper_oct):
+        """Build logarithmic frequency grid"""
+        n_oct = np.log2(f_hi / f_lo)
+        n_pts = int(np.floor(n_oct * nper_oct)) + 1
+        return f_lo * (2.0 ** (np.arange(n_pts) / nper_oct))
+
+    def basis_row_wavelet(t, A, f, delay, Nm):
+        """Compact-support (odd Nm>=5) wavelet: zero net v/disp for each component."""
+        start = delay
+        stop = delay + Nm * 0.5 / f
+        idx = (t >= start) & (t <= stop)
+        z = np.zeros_like(t)
+        tau = t[idx] - delay
+        z[idx] = A * np.sin(2 * np.pi * f * tau / Nm) * np.sin(2 * np.pi * f * tau)
+        return z
+
+    def basis_row_damped_sine(t, A, f, delay, zeta):
+        """A * exp(-zeta*2π f (t-d)) * sin(2π f (t-d)) for t>=delay; 0 otherwise."""
+        idx = t >= delay
+        z = np.zeros_like(t)
+        tau = t[idx] - delay
+        z[idx] = A * np.exp(-zeta * 2 * np.pi * f * tau) * np.sin(2 * np.pi * f * tau)
+        return z
+
+    def srs_accel_abs(acc_g, fs, freqs_hz, q):
+        """Absolute-acceleration SRS via bilinear-discretized SDOF filters."""
+        G2SI = 9.80665
+        ydd = np.asarray(acc_g) * G2SI
+        zeta = 1.0 / (2.0 * q)
+        dt = 1.0 / fs
+        out = np.empty_like(freqs_hz, float)
+        for i, fn in enumerate(freqs_hz):
+            wn = 2 * np.pi * fn
+            num = [2 * zeta * wn, wn**2]
+            den = [1.0, 2 * zeta * wn, wn**2]
+            bz, az, _ = cont2discrete((num, den), dt, method="bilinear")
+            b = bz.flatten()
+            a = az.flatten()
+            a_abs = lfilter(b, a, ydd)
+            out[i] = np.max(np.abs(a_abs)) / G2SI
+        return out
+
+    def clustered_delays(freqs, support_like, duration, t0, tail_span, focus, rng):
+        """High-f earlier (near t0), low-f later; small jitter ∝ support."""
+        order = np.argsort(-freqs)  # descending f -> ranks 0..1
+        r = np.empty_like(freqs, float)
+        r[order] = np.linspace(0.0, 1.0, freqs.size)
+        base = t0 + r * tail_span
+        jitter = (rng.random(freqs.size) - 0.5) * (1.0 - focus) * support_like
+        delay = np.clip(
+            base + jitter, 0.0, np.maximum(0.0, duration - support_like - 2.0 / fs)
+        )
+        return delay
+
+    def zero_crossings(x):
+        """Count zero crossings in signal"""
+        s = np.signbit(x)
+        return int(np.count_nonzero(s[1:] ^ s[:-1]))
+
+    # ---------- Input validation and setup ----------
+    srs_spec_hz_g = np.asarray(srs_spec_hz_g, float)
+    if srs_spec_hz_g.ndim != 2 or srs_spec_hz_g.shape[1] != 2:
+        raise ValueError("srs_spec_hz_g must be (M,2) array of (freq_Hz, SRS_G).")
+    fmin, fmax = float(srs_spec_hz_g[0, 0]), float(srs_spec_hz_g[-1, 0])
+    freqs = build_freq_grid(fmin, fmax, freqs_per_octave)
+    target_srs = log_interp(freqs, srs_spec_hz_g[:, 0], srs_spec_hz_g[:, 1])
+
+    t = np.arange(int(round(duration * fs))) / fs
+
+    # Basis selector
+    use_wavelet = basis.lower() == "wavelet"
+    if not use_wavelet and basis.lower() != "damped_sine":
+        raise ValueError("basis must be 'wavelet' or 'damped_sine'.")
+
+    # ---------- Main synthesis loop (outer trials) ----------
+    best = dict(score=np.inf)
+    for trial in range(n_trials):
+        if use_wavelet:
+            Nm = np.asarray(
+                [
+                    np.random.default_rng(rng.integers(1 << 31)).choice(nm_choices)
+                    for _ in freqs
+                ]
+            )
+            # support length for delay placement
+            support_like = Nm * 0.5 / freqs
+        else:
+            Nm = None
+            # effective support proxy for placing delays (few decay constants)
+            support_like = np.minimum(duration, 3.0 / (ds_zeta * 2 * np.pi * freqs))
+
+        # start with positive amplitudes to favor a single dominant lobe
+        A = 0.3 * target_srs * (1 + 0.5 * (rng.random(freqs.size) - 0.5))
+        A = np.abs(A)
+
+        delay = clustered_delays(
+            freqs, support_like, duration, t0, tail_span, focus, rng
+        )
+
+        # precompute basis rows (unit amplitude)
+        basis_rows = np.empty((freqs.size, t.size), float)
+        if use_wavelet:
+            for k, (fk, dk, Nk) in enumerate(zip(freqs, delay, Nm)):
+                basis_rows[k] = basis_row_wavelet(t, 1.0, fk, dk, Nk)
+        else:
+            for k, (fk, dk) in enumerate(zip(freqs, delay)):
+                basis_rows[k] = basis_row_damped_sine(t, 1.0, fk, dk, ds_zeta)
+
+        # Inner loop: SRS amplitude scaling
+        for _ in range(inner_iters):
+            acc = A @ basis_rows
+            achieved = srs_accel_abs(acc, fs, freqs, q)
+            scale = np.divide(target_srs, np.maximum(achieved, 1e-12))
+            scale = np.clip(scale, *clip_scale)  # stability only
+            A *= scale
+
+        # Final evaluation for this trial
+        acc = A @ basis_rows
+
+        # Optional drift cleanup for damped_sine (analysis convenience)
+        if (not use_wavelet) and (zero_drift_fix == "poly"):
+            # remove tiny linear trend in velocity to suppress residual drift
+            G2SI = 9.80665
+            v = np.cumsum(acc * G2SI) / fs
+            # fit a line to v and subtract its derivative from acceleration
+            n = len(v)
+            x = np.arange(n)
+            c1, c0 = np.polyfit(x, v, 1)  # v ≈ c1*x + c0
+            acc = acc - (c1 * G2SI) / fs  # derivative of linear term
+
+        achieved = srs_accel_abs(acc, fs, freqs, q)
+        err_db = 20.0 * np.log10(
+            np.maximum(achieved, 1e-12) / np.maximum(target_srs, 1e-12)
+        )
+        max_abs_err_db = float(np.max(np.abs(err_db)))
+
+        # Shock-aware score (analysis mode): SRS error + time-concentration + simplicity
+        win_lo = int(np.floor(t0 * fs))
+        win_hi = int(np.floor(min(duration, t0 + late_energy_tau) * fs))
+        e_total = float(np.sum(acc**2) + 1e-18)
+        e_focus = float(np.sum(acc[win_lo:win_hi] ** 2))
+        time_penalty = 1.0 - (e_focus / e_total)  # smaller is better
+        zc = zero_crossings(acc)
+        simplicity_penalty = zc / max(1, len(acc) // 8)
+        score = (
+            max_abs_err_db
+            + w_time * (10.0 * time_penalty)
+            + w_simplicity * (10.0 * simplicity_penalty)
+        )
+
+        if score < best.get("score", np.inf) or (
+            np.isclose(score, best.get("score", np.inf))
+            and max_abs_err_db < best.get("max_abs_err_db", np.inf)
+        ):
+            G2SI = 9.80665
+            v = np.cumsum(acc * G2SI) / fs
+            d = np.cumsum(v) / fs
+            best.update(
+                dict(
+                    score=score,
+                    max_abs_err_db=max_abs_err_db,
+                    acc=acc.copy(),
+                    achieved=achieved.copy(),
+                    trial=trial,
+                    time_focus_ratio=e_focus / e_total,
+                    zero_crossings=int(zc),
+                    peakA=float(np.max(np.abs(acc))),
+                    peakV=float(np.max(np.abs(v))),
+                    peakD=float(np.max(np.abs(d))),
+                    delays=delay.copy(),
+                    Nm=None if Nm is None else Nm.copy(),
+                    basis=basis.lower(),
+                )
+            )
+
+    # Prepare final report
+    report = dict(
+        freqs_hz=freqs,
+        target_srs_g=target_srs,
+        achieved_srs_g=best["achieved"],
+        max_abs_error_db=best["max_abs_err_db"],
+        time_focus_ratio=float(best["time_focus_ratio"]),
+        zero_crossings=int(best["zero_crossings"]),
+        peak_accel_g=float(best["peakA"]),
+        peak_velocity_si=float(best["peakV"]),
+        peak_displacement_si=float(best["peakD"]),
+        winner_trial=int(best["trial"]),
+        q=float(q),
+        fs=float(fs),
+        t0=float(t0),
+        tail_span=float(tail_span),
+        basis=best["basis"],
+    )
+    return t, best["acc"], report
