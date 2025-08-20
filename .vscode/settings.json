@@ -18,6 +18,11 @@
   "github.copilot.inlineSuggest.enable": true,
   "python.analysis.autoImportCompletions": false,
   "python.analysis.completeFunctionParens": false,
+  "notebook.output.clearOnCellExecute": false,
+  "notebook.output.scrolling": true,
+  "notebook.diff.ignoreMetadata": true,
+  "notebook.diff.ignoreOutputs": true,
+  "jupyter.exportWithOutputEnabled": false,
   "python.analysis.indexing": false,
   "python.analysis.packageIndexDepths": [
     {

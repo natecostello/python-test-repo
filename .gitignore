@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Jupyter Notebook outputs (optional - uncomment if you don't want to track outputs)
+# *.ipynb
