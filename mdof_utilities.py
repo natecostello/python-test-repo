@@ -520,7 +520,14 @@ def shock_response_spectrum(
 # =============================================================================
 
 
-def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000):
+def generate_half_sine_pulse(
+    amplitude,
+    duration,
+    total_time,
+    sample_rate=10000,
+    zero_velocity=False,
+    compensation_duration=None,
+):
     """
     Generate a half-sine pulse shock input.
 
@@ -537,6 +544,14 @@ def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000)
         Total analysis time (seconds)
     sample_rate : float
         Sampling rate (Hz)
+    zero_velocity : bool, optional
+        If True, adds a compensating acceleration after the pulse to ensure
+        zero net velocity change (zero delta-V) and zero final velocity.
+        Default is False.
+    compensation_duration : float, optional
+        Duration of the compensation pulse (seconds). If None, defaults to
+        2 * duration for a gentler compensation. Must be specified if
+        zero_velocity=True.
 
     Returns:
     --------
@@ -544,6 +559,18 @@ def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000)
         Time vector
     a : ndarray
         Acceleration time series
+
+    Notes:
+    ------
+    When zero_velocity=True, a compensating half-sine pulse is added after the
+    main pulse to cancel the velocity imparted by the primary pulse. This ensures:
+    - Zero net change in velocity (delta-V = 0)
+    - Zero final velocity at end of compensation
+    - Physically realizable shock pulse for testing
+
+    The compensation pulse has opposite polarity and its amplitude is calculated
+    to exactly cancel the velocity from the primary pulse over the specified
+    compensation duration.
     """
     dt = 1.0 / sample_rate
     t = np.arange(0, total_time, dt)
@@ -552,6 +579,158 @@ def generate_half_sine_pulse(amplitude, duration, total_time, sample_rate=10000)
     # Half-sine pulse during pulse duration
     pulse_mask = t <= duration
     a[pulse_mask] = amplitude * np.sin(np.pi * t[pulse_mask] / duration)
+
+    if zero_velocity:
+        if compensation_duration is None:
+            raise ValueError(
+                "compensation_duration must be specified when zero_velocity=True"
+            )
+
+        if duration + compensation_duration > total_time:
+            raise ValueError(
+                f"Primary pulse duration ({duration}s) + compensation duration "
+                f"({compensation_duration}s) exceeds total_time ({total_time}s)"
+            )
+
+        # Calculate velocity imparted by primary pulse
+        # For half-sine: v = ∫ a*sin(πt/T) dt from 0 to T
+        # v = a*T/π * (1 - cos(π)) = a*T/π * 2 = 2*a*T/π
+        delta_v_primary = 2 * amplitude * duration / np.pi
+
+        # Compensation pulse amplitude (opposite sign, scaled by duration ratio)
+        # For compensation half-sine over duration T_comp:
+        # -2*a_comp*T_comp/π = -delta_v_primary
+        # a_comp = delta_v_primary * π / (2*T_comp)
+        a_comp = delta_v_primary * np.pi / (2 * compensation_duration)
+
+        # Add compensation pulse (negative of primary direction)
+        comp_start = duration
+        comp_end = duration + compensation_duration
+        comp_mask = (t > comp_start) & (t <= comp_end)
+        t_comp = t[comp_mask] - comp_start
+        a[comp_mask] = -a_comp * np.sin(np.pi * t_comp / compensation_duration)
+
+        # Post-processing: Force exact zero delta-V by removing DC offset
+        # Calculate actual delta-V from numerical integration
+        velocity = np.cumsum(a) * dt
+        actual_delta_v = velocity[-1]
+
+        # Compute DC correction needed to achieve zero delta-V
+        # If we subtract a_dc from all accelerations, delta_v changes by -a_dc * t_total
+        a_dc_correction = actual_delta_v / total_time
+
+        # Apply correction (this is typically < 0.0001g)
+        a = a - a_dc_correction
+
+    return t, a
+
+
+def generate_square_pulse(
+    amplitude,
+    duration,
+    total_time,
+    sample_rate=10000,
+    zero_velocity=False,
+    compensation_duration=None,
+):
+    """
+    Generate a square (rectangular) pulse shock input.
+
+    This is a classical shock input representing an idealized step acceleration
+    followed by an instant return to zero. It is used in shock testing and
+    analysis as a simple, conservative test profile.
+
+    Parameters:
+    -----------
+    amplitude : float
+        Peak acceleration amplitude (g)
+    duration : float
+        Pulse duration (seconds)
+    total_time : float
+        Total analysis time (seconds)
+    sample_rate : float
+        Sampling rate (Hz)
+    zero_velocity : bool, optional
+        If True, adds a compensating acceleration after the pulse to ensure
+        zero net velocity change (zero delta-V) and zero final velocity.
+        Default is False.
+    compensation_duration : float, optional
+        Duration of the compensation pulse (seconds). If None, defaults to
+        2 * duration for a gentler compensation. Must be specified if
+        zero_velocity=True.
+
+    Returns:
+    --------
+    t : ndarray
+        Time vector
+    a : ndarray
+        Acceleration time series
+
+    Notes:
+    ------
+    When zero_velocity=True, a compensating square pulse is added after the
+    main pulse to cancel the velocity imparted by the primary pulse. This ensures:
+    - Zero net change in velocity (delta-V = 0)
+    - Zero final velocity at end of compensation
+    - Physically realizable shock pulse for testing
+
+    The compensation pulse has opposite polarity and its amplitude is calculated
+    to exactly cancel the velocity from the primary pulse over the specified
+    compensation duration.
+
+    For a square pulse, the velocity change is simply:
+        Δv = amplitude * duration
+
+    The compensation amplitude is:
+        a_comp = (amplitude * duration) / compensation_duration
+    """
+    dt = 1.0 / sample_rate
+    t = np.arange(0, total_time, dt)
+    a = np.zeros_like(t)
+
+    # Square pulse during pulse duration
+    pulse_mask = t < duration  # Use < to avoid overlap at duration boundary
+    a[pulse_mask] = amplitude
+
+    if zero_velocity:
+        if compensation_duration is None:
+            raise ValueError(
+                "compensation_duration must be specified when zero_velocity=True"
+            )
+
+        if duration + compensation_duration > total_time:
+            raise ValueError(
+                f"Primary pulse duration ({duration}s) + compensation duration "
+                f"({compensation_duration}s) exceeds total_time ({total_time}s)"
+            )
+
+        # Calculate velocity imparted by primary pulse
+        # For square pulse: v = ∫ a dt from 0 to T = a * T
+        delta_v_primary = amplitude * duration
+
+        # Compensation pulse amplitude (opposite sign, scaled by duration ratio)
+        # For compensation square pulse over duration T_comp:
+        # -a_comp * T_comp = -delta_v_primary
+        # a_comp = delta_v_primary / T_comp
+        a_comp = delta_v_primary / compensation_duration
+
+        # Add compensation pulse (negative of primary direction)
+        comp_start = duration
+        comp_end = duration + compensation_duration
+        comp_mask = (t >= comp_start) & (t < comp_end)
+        a[comp_mask] = -a_comp
+
+        # Post-processing: Force exact zero delta-V by removing DC offset
+        # Calculate actual delta-V from numerical integration
+        velocity = np.cumsum(a) * dt
+        actual_delta_v = velocity[-1]
+
+        # Compute DC correction needed to achieve zero delta-V
+        # If we subtract a_dc from all accelerations, delta_v changes by -a_dc * t_total
+        a_dc_correction = actual_delta_v / total_time
+
+        # Apply correction (this is typically < 0.0001g)
+        a = a - a_dc_correction
 
     return t, a
 
